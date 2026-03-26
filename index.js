@@ -17,9 +17,21 @@ const DEFAULT_ALLOWED_BASE_DOMAINS = [
   "gg.hls2.xyz",
   "90minlive.online",
   "irib.ir",
+
+  // ✅ Telewebion main site
   "telewebion.ir",
-  "www.telewebion.ir"
+  "www.telewebion.ir",
+
+  // ✅ Telewebion CDN and streaming hosts
+  "ncdn.telewebion.ir",
+  "ccdn.telewebion.ir",
+  "s1.telewebion.ir",
+  "s2.telewebion.ir",
+  "s3.telewebion.ir",
+  "s4.telewebion.ir",
+  "video.telewebion.ir"
 ];
+
 
 
 const DEFAULT_FORCE_REFERER = "https://aparatchi.com";
