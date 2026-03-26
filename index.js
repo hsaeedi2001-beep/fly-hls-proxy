@@ -17,7 +17,10 @@ const DEFAULT_ALLOWED_BASE_DOMAINS = [
   "gg.hls2.xyz",
   "90minlive.online",
   "irib.ir",
+  "telewebion.ir",
+  "www.telewebion.ir"
 ];
+
 
 const DEFAULT_FORCE_REFERER = "https://aparatchi.com";
 
