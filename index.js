@@ -1,56 +1,210 @@
- 
+
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import { Readable } from "stream";
 
+// --- CORS config ---
+const ALLOW_ORIGIN_REGEX = /^https:\/\/(.+\.)?aparatchi\.com$/;
+const ALLOW_METHODS = "GET,HEAD,OPTIONS";
+const ALLOW_HEADERS = "Range,Origin,Accept,Cache-Control,Pragma,Referer,User-Agent";
+const EXPOSE_HEADERS = "Content-Length,Content-Range,Accept-Ranges";
+
+// --- Domain whitelist ---
+const DEFAULT_ALLOWED_BASE_DOMAINS = [
+  "gg.hls2.xyz",
+  "90minlive.online",
+  "irib.ir",
+];
+
+// --- Referer override ---
+const DEFAULT_FORCE_REFERER = "https://aparatchi.com";
+
 const app = express();
-app.use(cors());
 app.disable("x-powered-by");
 
-// Home route (so Render does not return Forbidden)
+// Home route (avoid Forbidden)
 app.get("/", (req, res) => {
-  res.send("✅ HLS Proxy with Playlist Rewriting (Render.com)");
+  res.send("✅ Aparatchi-style HLS Proxy running on Render.com");
 });
 
-// ✅ Helper to rewrite all playlist URLs
-function rewritePlaylist(body, playlistUrl, baseProxy) {
-  const lines = body.split(/\r?\n/);
-  const out = [];
+// Health endpoint
+app.get("/healthz", (req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
 
-  for (let line of lines) {
-    const trimmed = line.trim();
+// Debug endpoint
+app.get("/debug", (req, res) => {
+  const target = getTargetUrl(req);
+  let host = null;
+  try { host = target ? new URL(target).hostname : null; } catch {}
+  res.json({ target, host });
+});
 
-    // Keep empty lines
-    if (!trimmed) {
-      out.push(line);
-      continue;
-    }
+// OPTIONS preflight
+app.options("*", (req, res) => {
+  applyCors(res, req.get("Origin") || "");
+  res.status(204).send();
+});
 
-    // ✅ Rewrite URI="..." inside tags (for KEY, MAP)
-    if (trimmed.startsWith("#")) {
-      line = line.replace(/URI="([^"]+)"/g, (_, uri) => {
-        const absolute = new URL(uri, playlistUrl).toString();
-        return `URI="${baseProxy}?url=${encodeURIComponent(absolute)}"`;
-      });
-
-      out.push(line);
-      continue;
-    }
-
-    // ✅ Rewrite segment + sub-playlist lines
-    const absoluteUrl = new URL(trimmed, playlistUrl).toString();
-    const proxied = `${baseProxy}?url=${encodeURIComponent(absoluteUrl)}`;
-    out.push(proxied);
+// MAIN PROXY
+app.get("/proxy*", async (req, res) => {
+  const method = "GET";
+  const origin = req.get("Origin") || "";
+  
+  const target = getTargetUrl(req);
+  if (!target) {
+    applyCors(res, origin);
+    return res.status(400).json({ error: "Missing ?url=" });
   }
 
-  return out.join("\n");
+  // Whitelist
+  const allowed = DEFAULT_ALLOWED_BASE_DOMAINS;
+  if (!isHostAllowed(target, allowed)) {
+    applyCors(res, origin);
+    return res.status(403).json({ error: "Target host not allowed", target });
+  }
+
+  // Build upstream headers
+  const upstreamHeaders = {
+    "User-Agent": req.get("User-Agent"),
+    "Range": req.get("Range"),
+    "Accept": req.get("Accept") || "application/vnd.apple.mpegurl,application/x-mpegurl,video/*;q=0.9,*/*;q=0.8",
+    "Cache-Control": req.get("Cache-Control"),
+    "Pragma": req.get("Pragma"),
+    "Referer": DEFAULT_FORCE_REFERER || req.get("Referer")
+  };
+
+  console.log("[proxy]", JSON.stringify({
+    target,
+    range: req.get("Range") || null,
+    origin
+  }));
+
+  // Fetch upstream
+  let upstream;
+  try {
+    upstream = await fetch(target, {
+      method,
+      headers: upstreamHeaders,
+      redirect: "follow"
+    });
+  } catch (e) {
+    applyCors(res, origin);
+    return res.status(502).json({ error: "Upstream fetch failed", detail: e.toString() });
+  }
+
+  const upstreamCT = upstream.headers.get("content-type") || "";
+  const contentType = normalizeContentType(target, upstreamCT);
+
+  // Playlist?
+  const isPlaylist = isM3U8(contentType, target);
+
+  applyCors(res, origin);
+  res.set("Content-Type", contentType);
+
+  if (isPlaylist) {
+    let text;
+    try {
+      text = await upstream.text();
+    } catch (e) {
+      return res.status(502).send("Bad Gateway");
+    }
+
+    const proxyBase = `${req.protocol}://${req.get("host")}/proxy`;
+    const rewritten = rewritePlaylistText(text, target, proxyBase);
+
+    res.set("Content-Type", "application/vnd.apple.mpegurl");
+    return res.send(rewritten);
+  }
+
+  // Stream binary segments
+  res.set("Content-Type", contentType);
+  return streamReadable(upstream.body, res);
+});
+
+// PORT binding for Render
+app.listen(process.env.PORT || 8080, () => {
+  console.log("✅ Aparatchi HLS Proxy running on Render.com");
+});
+
+/* ------------------------
+   Helper Functions (converted from Worker)
+------------------------ */
+
+function applyCors(res, origin) {
+  const allowOrigin = (origin && ALLOW_ORIGIN_REGEX.test(origin)) ? origin : "https://aparatchi.com";
+
+  res.set({
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": ALLOW_METHODS,
+    "Access-Control-Allow-Headers": ALLOW_HEADERS,
+    "Access-Control-Expose-Headers": EXPOSE_HEADERS,
+    "Access-Control-Allow-Credentials": "false",
+    "Vary": "Origin"
+  });
 }
 
-// ✅ Streaming helper for WHATWG Fetch → Node Readable Stream
-async function streamToNodeReadable(webStream, res) {
-  const reader = webStream.getReader();
+function getTargetUrl(req) {
+  const qp = req.query.url;
+  if (qp) return safeDecode(qp);
 
+  const path = req.path.split("/").slice(2).join("/");
+  if (path) return safeDecode(path);
+
+  return null;
+}
+
+function safeDecode(raw) {
+  try { return Buffer.from(raw, "base64").toString().trim(); } catch {}
+  try { return decodeURIComponent(raw); } catch {}
+  return raw;
+}
+
+function isHostAllowed(targetUrl, list) {
+  try {
+    const host = new URL(targetUrl).hostname.toLowerCase();
+    return list.some(base => host === base || host.endsWith("." + base));
+  } catch {
+    return false;
+  }
+}
+
+function isM3U8(ct, url) {
+  ct = ct.toLowerCase();
+  url = url.toLowerCase();
+  return ct.includes("mpegurl") || url.endsWith(".m3u8");
+}
+
+function normalizeContentType(url, ct) {
+  ct = (ct || "").toLowerCase();
+  if (ct.includes("mpegurl")) return "application/vnd.apple.mpegurl";
+  if (url.toLowerCase().endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
+  if (ct.includes("mp2t")) return "video/mp2t";
+  if (url.toLowerCase().endsWith(".ts")) return "video/mp2t";
+  return ct || "application/octet-stream";
+}
+
+function rewritePlaylistText(text, playlistUrl, proxyBase) {
+  return text.split(/\r?\n/).map(line => {
+    const trimmed = line.trim();
+
+    if (!trimmed) return line;
+
+    if (trimmed.startsWith("#")) {
+      return line.replace(/URI="([^"]+)"/g, (_, uri) => {
+        const absolute = new URL(uri, playlistUrl).toString();
+        return `URI="${proxyBase}?url=${encodeURIComponent(absolute)}"`;
+      });
+    }
+
+    const absolute = new URL(trimmed, playlistUrl).toString();
+    return `${proxyBase}?url=${encodeURIComponent(absolute)}`;
+  }).join("\n");
+}
+
+async function streamReadable(webStream, res) {
+  const reader = webStream.getReader();
   const nodeStream = new Readable({
     async read() {
       const { done, value } = await reader.read();
@@ -58,60 +212,5 @@ async function streamToNodeReadable(webStream, res) {
       this.push(Buffer.from(value));
     }
   });
-
   nodeStream.pipe(res);
 }
-
-// ✅ Proxy endpoint
-app.get("/proxy", async (req, res) => {
-  const target = req.query.url;
-  if (!target) {
-    return res.status(400).json({ error: "Missing ?url=" });
-  }
-
-  try {
-    const upstream = await fetch(target, {
-      headers: {
-        "User-Agent": req.headers["user-agent"],
-        "Range": req.headers["range"] || undefined,
-        "Accept": req.headers["accept"] || "*/*",
-        "Referer": req.headers["referer"] || ""
-      }
-    });
-
-    // Forward essential CORS + HLS headers
-    res.set("Access-Control-Allow-Origin", "*");
-    res.set("Access-Control-Allow-Headers", "*");
-    res.set("Access-Control-Expose-Headers", "Content-Length,Content-Range,Accept-Ranges");
-
-    const contentType = upstream.headers.get("content-type") || "";
-
-    // ✅ Playlist rewriting
-    if (contentType.includes("mpegurl") || target.toLowerCase().endsWith(".m3u8")) {
-      const text = await upstream.text();
-
-      const rewritten = rewritePlaylist(
-        text,
-        target,
-        `${req.protocol}://${req.get("host")}/proxy`
-      );
-
-      res.set("Content-Type", "application/vnd.apple.mpegurl");
-      return res.send(rewritten);
-    }
-
-    // ✅ Segment / binary streaming (TS, MP4, M4S, etc.)
-    res.set("Content-Type", contentType || "application/octet-stream");
-    return streamToNodeReadable(upstream.body, res);
-
-  } catch (err) {
-    console.error("Proxy error:", err);
-    res.status(502).json({ error: "Upstream fetch failed", detail: err.toString() });
-  }
-});
-
-// ✅ Bind to Render's PORT
-app.listen(process.env.PORT || 8080, () => {
-  console.log("✅ HLS Proxy with rewriting running on Render.com");
-});
-``
